@@ -230,11 +230,21 @@ static void spawn_process(const char *unit, ULONGLONG frn)
 {
     resolve_modules();
 
-    HANDLE hVol = open_volume(unit);
+    HANDLE hVol  = INVALID_HANDLE_VALUE;
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    HANDLE hSection = NULL;
+    HANDLE hProc = NULL;
+    WCHAR *path_buf = NULL;
+
+    pfnNtClose pNtCl = (pfnNtClose)GetProcAddress(g_ntdll, "NtClose");
+    pfnNtUnmapViewOfSection pNtUMV =
+        (pfnNtUnmapViewOfSection)GetProcAddress(g_ntdll, "NtUnmapViewOfSection");
+
+    hVol = open_volume(unit);
     if (hVol == INVALID_HANDLE_VALUE) return;
 
-    HANDLE hFile = open_by_frn(hVol, frn);
-    if (hFile == INVALID_HANDLE_VALUE) { CloseHandle(hVol); return; }
+    hFile = open_by_frn(hVol, frn);
+    if (hFile == INVALID_HANDLE_VALUE) goto cleanup;
     printf("[+] Successfully opened handle to file by FRN '0x%llx' on volume '\\\\.\\%s:'.\n", frn, unit);
 
     /* NT API pointers */
@@ -249,12 +259,11 @@ static void spawn_process(const char *unit, ULONGLONG frn)
     pfnRtlCreateProcessParametersEx pRtlCPP = (pfnRtlCreateProcessParametersEx)GetProcAddress(g_ntdll, "RtlCreateProcessParametersEx");
 
     /* create image section */
-    HANDLE hSection = NULL;
     NTSTATUS st = pNtCS(&hSection, MY_SECTION_ALL_ACCESS, NULL, NULL,
                         MY_PAGE_EXECUTE_READ, MY_SEC_IMAGE, hFile);
     if (!NT_SUCCESS(st)) {
         printf("[x] Failed to create section. NTSTATUS: 0x%lx.\n", (unsigned long)st);
-        CloseHandle(hFile); CloseHandle(hVol); return;
+        goto cleanup;
     }
 
     /* map into self to read EP */
@@ -265,38 +274,33 @@ static void spawn_process(const char *unit, ULONGLONG frn)
                &sec_offset, &view_size, 2, 0, MY_PAGE_EXECUTE_READ);
     if (!NT_SUCCESS(st)) {
         printf("[x] Failed to map view of section. NTSTATUS: 0x%lx.\n", (unsigned long)st);
-        CloseHandle(hFile); CloseHandle(hVol); return;
+        goto cleanup;
     }
     printf("[+] File section mapped into current process. Base address: 0x%llx.\n",
            (unsigned long long)(ULONG_PTR)view_base);
     ULONG ep_rva = get_entry_point_rva(view_base);
 
-    /* unmap the local view — we only needed it to read the EP RVA */
-    pfnNtUnmapViewOfSection pNtUMV =
-        (pfnNtUnmapViewOfSection)GetProcAddress(g_ntdll, "NtUnmapViewOfSection");
     if (pNtUMV) pNtUMV(GetCurrentProcess(), view_base);
 
     /* create process from section */
-    HANDLE hProc = NULL;
     st = pNtCP(&hProc, MY_PROCESS_ALL_ACCESS, NULL,
                GetCurrentProcess(), 0, hSection, NULL, NULL, 0);
     if (!NT_SUCCESS(st)) {
         printf("[x] Failed to create process from section. NTSTATUS: 0x%lx.\n", (unsigned long)st);
-        CloseHandle(hFile); CloseHandle(hVol); return;
+        goto cleanup;
     }
     printf("[+] Process created from section. Handle: 0x%llx.\n",
            (unsigned long long)(ULONG_PTR)hProc);
 
     /* section handle no longer needed */
-    pfnNtClose pNtCl = (pfnNtClose)GetProcAddress(g_ntdll, "NtClose");
-    if (pNtCl) pNtCl(hSection);
+    if (pNtCl) { pNtCl(hSection); hSection = NULL; }
 
     /* get PEB address */
     PROCESS_BASIC_INFORMATION pbi = {0};
     st = pNtQIP(hProc, 0, &pbi, sizeof(pbi), NULL);
     if (!NT_SUCCESS(st)) {
         printf("[x] Call to NtQueryInformationProcess failed.\n");
-        CloseHandle(hFile); CloseHandle(hVol); return;
+        goto cleanup;
     }
     ULONG_PTR peb_addr = (ULONG_PTR)pbi.PebBaseAddress;
     printf("[+] New process PEB address obtained: 0x%llx\n",
@@ -308,7 +312,7 @@ static void spawn_process(const char *unit, ULONGLONG frn)
                 sizeof(image_base), NULL);
     if (!NT_SUCCESS(st)) {
         printf("[x] Call to NtReadVirtualMemory failed.\n");
-        CloseHandle(hFile); CloseHandle(hVol); return;
+        goto cleanup;
     }
     printf("[+] Remote process image base address: 0x%llx\n",
            (unsigned long long)image_base);
@@ -318,15 +322,15 @@ static void spawn_process(const char *unit, ULONGLONG frn)
         (pfnGetFinalPathNameByHandleW)GetProcAddress(g_k32,
             "GetFinalPathNameByHandleW");
     const DWORD path_cap = 32768;
-    WCHAR *path_buf = (WCHAR *)malloc(path_cap * sizeof(WCHAR));
+    path_buf = (WCHAR *)malloc(path_cap * sizeof(WCHAR));
     if (!path_buf) {
         printf("[x] Memory allocation failed.\n");
-        CloseHandle(hFile); CloseHandle(hVol); return;
+        goto cleanup;
     }
     DWORD path_len = pGetPath(hFile, path_buf, path_cap, 0);
     if (path_len == 0 || path_len >= path_cap) {
         printf("[x] Retrieval of file path failed.\n");
-        free(path_buf); CloseHandle(hFile); CloseHandle(hVol); return;
+        goto cleanup;
     }
     /* strip \\?\ prefix */
     WCHAR *final_path = path_buf;
@@ -341,7 +345,7 @@ static void spawn_process(const char *unit, ULONGLONG frn)
     PVOID env_block = NULL;
     if (!pCEB || !pCEB(&env_block, NULL, TRUE)) {
         printf("[x] Call to CreateEnvironmentBlock failed.\n");
-        CloseHandle(hFile); CloseHandle(hVol); return;
+        goto cleanup;
     }
     size_t env_size = get_env_size((const WCHAR *)env_block);
     printf("[+] New environment block created. Size: %llu bytes.\n",
@@ -358,7 +362,7 @@ static void spawn_process(const char *unit, ULONGLONG frn)
     if (!NT_SUCCESS(st)) {
         printf("[x] Call to RtlCreateProcessParametersEx failed. NTSTATUS: %lx.\n",
                (unsigned long)st);
-        CloseHandle(hFile); CloseHandle(hVol); return;
+        goto cleanup;
     }
     printf("[+] RtlUserProcessParameters structure populated. Size: %lu bytes.\n",
            params->MaximumLength);
@@ -371,13 +375,13 @@ static void spawn_process(const char *unit, ULONGLONG frn)
     if (!NT_SUCCESS(st)) {
         printf("[x] Failed to allocate memory for env block. NTSTATUS: %lx.\n",
                (unsigned long)st);
-        CloseHandle(hFile); CloseHandle(hVol); return;
+        goto cleanup;
     }
     st = pNtWVM(hProc, remote_env, env_block, env_size, NULL);
     if (!NT_SUCCESS(st)) {
         printf("[x] Failed to write environment block. NTSTATUS: %lx.\n",
                (unsigned long)st);
-        CloseHandle(hFile); CloseHandle(hVol); return;
+        goto cleanup;
     }
     printf("[+] New environment block successfully written to the remote process. Address: 0x%llx\n",
            (unsigned long long)(ULONG_PTR)remote_env);
@@ -393,7 +397,7 @@ static void spawn_process(const char *unit, ULONGLONG frn)
     if (!NT_SUCCESS(st)) {
         printf("[x] Failed to allocate memory for parameters. NTSTATUS: %lx.\n",
                (unsigned long)st);
-        CloseHandle(hFile); CloseHandle(hVol); return;
+        goto cleanup;
     }
 
     LONG_PTR delta = (LONG_PTR)((ULONG_PTR)remote_params - (ULONG_PTR)params);
@@ -403,7 +407,7 @@ static void spawn_process(const char *unit, ULONGLONG frn)
     if (!NT_SUCCESS(st)) {
         printf("[x] Failed to write parameters. NTSTATUS: %lx.\n",
                (unsigned long)st);
-        CloseHandle(hFile); CloseHandle(hVol); return;
+        goto cleanup;
     }
     printf("[+] RtlUserProcessParameters structure written to the remote process. Address: 0x%llx\n",
            (unsigned long long)(ULONG_PTR)remote_params);
@@ -415,7 +419,7 @@ static void spawn_process(const char *unit, ULONGLONG frn)
     if (!NT_SUCCESS(st)) {
         printf("[x] Failed to patch the PEB. NTSTATUS: %lx.\n",
                (unsigned long)st);
-        CloseHandle(hFile); CloseHandle(hVol); return;
+        goto cleanup;
     }
     printf("[+] New process' PEB patched.\n");
 
@@ -428,11 +432,14 @@ static void spawn_process(const char *unit, ULONGLONG frn)
                (unsigned long)st);
     } else {
         printf("[+] Initial thread launched.\n");
+        if (pNtCl) pNtCl(hThread);
     }
 
+cleanup:
     free(path_buf);
-    CloseHandle(hFile);
-    CloseHandle(hVol);
+    if (hSection && pNtCl) pNtCl(hSection);
+    if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+    if (hVol  != INVALID_HANDLE_VALUE) CloseHandle(hVol);
 }
 
 /* ================================================================

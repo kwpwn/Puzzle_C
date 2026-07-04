@@ -379,7 +379,7 @@ static void CALLBACK fetch_data_cb(
             (pfnCfOpenFileWithOplock)GetProcAddress(cld(), "CfOpenFileWithOplock");
         pfnCfCloseHandle pClose =
             (pfnCfCloseHandle)GetProcAddress(cld(), "CfCloseHandle");
-        if (!pOpen) { free(wpath); goto menu; }
+        if (!pOpen || !pClose) { free(wpath); goto menu; }
 
         HANDLE ph = NULL;
         HRESULT hr = pOpen(wpath, 0, &ph);
@@ -571,6 +571,11 @@ static void dehydrate_file(void)
             "CfReleaseProtectedHandle");
     pfnCfCloseHandle pClose =
         (pfnCfCloseHandle)GetProcAddress(cld(), "CfCloseHandle");
+
+    if (!pOpen || !pGetH || !pDehy || !pRelease || !pClose) {
+        printf("[x] Failed to resolve CldApi dehydration functions.\n");
+        return;
+    }
 
     char path[MAX_PATH * 2];
     snprintf(path, sizeof(path), "%s\\%s", g_sync_root, g_ph_name);
